@@ -1,16 +1,14 @@
 import streamlit as st
 import pandas as pd
 import numpy as np
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, time
 import yfinance as yf
 import talib
 import plotly.graph_objects as go
-import plotly.express as px
+from plotly.subplots import make_subplots
 import logging
 from functools import lru_cache
-import time
-import requests
-from typing import Dict, List, Tuple, Optional
+import pytz
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -18,74 +16,106 @@ logger = logging.getLogger(__name__)
 
 # Page configuration
 st.set_page_config(
-    page_title="Momentum Activation Engine",
-    page_icon="🚀",
+    page_title="Day Trader Engine - 4AM-8PM",
+    page_icon="⚡",
     layout="wide",
     initial_sidebar_state="expanded"
 )
 
-# Custom CSS
+# Custom CSS for day trader
 st.markdown("""
 <style>
     .main {
-        padding-top: 1rem;
+        padding-top: 0.5rem;
     }
-    .metric-card {
+    .speed-badge-hot {
+        background-color: #ff4444;
+        color: white;
+        padding: 8px 12px;
+        border-radius: 4px;
+        font-weight: bold;
+        font-size: 14px;
+        display: inline-block;
+    }
+    .speed-badge-warm {
+        background-color: #ffaa00;
+        color: black;
+        padding: 8px 12px;
+        border-radius: 4px;
+        font-weight: bold;
+        font-size: 14px;
+        display: inline-block;
+    }
+    .speed-badge-cool {
+        background-color: #00aa00;
+        color: white;
+        padding: 8px 12px;
+        border-radius: 4px;
+        font-weight: bold;
+        font-size: 14px;
+        display: inline-block;
+    }
+    .metric-big {
         background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
         padding: 20px;
-        border-radius: 10px;
+        border-radius: 8px;
         color: white;
-        text-align: center;
-    }
-    .active-badge {
-        background-color: #d4edda;
-        color: #155724;
-        padding: 10px;
-        border-radius: 5px;
-        font-weight: bold;
-        display: inline-block;
-    }
-    .watch-badge {
-        background-color: #fff3cd;
-        color: #856404;
-        padding: 10px;
-        border-radius: 5px;
-        font-weight: bold;
-        display: inline-block;
-    }
-    .noise-badge {
-        background-color: #f8d7da;
-        color: #721c24;
-        padding: 10px;
-        border-radius: 5px;
-        font-weight: bold;
-        display: inline-block;
-    }
-    .stTabs [data-baseweb="tab-list"] button {
+        font-size: 18px;
         font-weight: bold;
     }
 </style>
 """, unsafe_allow_html=True)
 
 # ============================================================================
-# TECHNICAL ANALYSIS FUNCTIONS
+# MARKET HOURS CHECK
 # ============================================================================
 
-@st.cache_data(ttl=600)
-def fetch_stock_data(ticker: str, period: str = "3mo") -> Optional[pd.DataFrame]:
-    """Fetch historical stock data with error handling"""
+def get_market_status():
+    """Check if market is within trading hours (4AM - 8PM ET)"""
+    now = datetime.now(pytz.timezone('US/Eastern'))
+    current_time = now.time()
+    
+    market_open = time(4, 0)  # 4AM ET
+    market_close = time(20, 0)  # 8PM ET
+    
+    if market_open <= current_time <= market_close:
+        return "OPEN", now
+    else:
+        return "CLOSED", now
+
+# ============================================================================
+# FAST DATA FETCHING - 1min, 5min, 15min
+# ============================================================================
+
+@st.cache_data(ttl=60)  # Refresh every 60 seconds for day trading
+def fetch_intraday_data(ticker: str, interval: str = "1m", period: str = "1d") -> pd.DataFrame:
+    """Fetch ultra-fast intraday data (1m, 5m, 15m candles)"""
     try:
-        data = yf.download(ticker, period=period, progress=False, threads=False)
+        data = yf.download(
+            ticker, 
+            interval=interval, 
+            period=period,
+            progress=False,
+            threads=False,
+            prepost=True  # Include pre-market and after-hours
+        )
         if len(data) == 0:
             return None
+        
+        # Add timestamp
+        data['Timestamp'] = data.index
         return data
     except Exception as e:
-        logger.error(f"Error fetching data for {ticker}: {e}")
+        logger.error(f"Error fetching {interval} data for {ticker}: {e}")
         return None
 
-def calculate_indicators(df: pd.DataFrame) -> Optional[Dict]:
-    """Calculate comprehensive technical indicators"""
-    if df is None or len(df) < 30:
+# ============================================================================
+# SPEED ANALYSIS - Check Price Action First
+# ============================================================================
+
+def analyze_speed_and_price(df: pd.DataFrame) -> dict:
+    """Analyze speed (volatility/momentum) and price action FIRST"""
+    if df is None or len(df) < 3:
         return None
     
     try:
@@ -94,345 +124,335 @@ def calculate_indicators(df: pd.DataFrame) -> Optional[Dict]:
         low = df['Low'].values
         volume = df['Volume'].values
         
+        # SPEED: Recent price momentum (last 5 candles)
+        price_range_5 = np.max(high[-5:]) - np.min(low[-5:])
+        price_change_5 = ((close[-1] - close[-5]) / close[-5] * 100) if len(close) >= 5 else 0
+        current_price = close[-1]
+        
+        # SPREAD: Bid-Ask equivalent (current candle)
+        current_candle_spread = (high[-1] - low[-1]) / close[-1] * 100
+        avg_spread = np.mean([(high[i] - low[i]) / close[i] * 100 for i in range(len(close))])
+        
+        # VOLUME: Current vs Average
+        avg_volume_20 = np.mean(volume[-20:]) if len(volume) >= 20 else np.mean(volume)
+        current_volume = volume[-1]
+        volume_ratio = current_volume / avg_volume_20 if avg_volume_20 > 0 else 1
+        
+        # VOLATILITY (Speed indicator)
+        atr = talib.ATR(high, low, close, timeperiod=14)[-1] if len(close) >= 14 else 0
+        atr_percent = (atr / current_price) * 100 if current_price > 0 else 0
+        
+        # Recent volatility (last 10 candles)
+        recent_volatility = np.std(close[-10:]) / np.mean(close[-10:]) * 100
+        
+        # Determine SPEED category
+        if atr_percent > 2.5 or recent_volatility > 3:
+            speed = "🔥 HOT"
+            speed_score = 90
+        elif atr_percent > 1.5 or recent_volatility > 2:
+            speed = "⚠️ WARM"
+            speed_score = 60
+        else:
+            speed = "❄️ COOL"
+            speed_score = 30
+        
+        # Price momentum direction
+        if price_change_5 > 2:
+            momentum = "📈 UP"
+        elif price_change_5 < -2:
+            momentum = "📉 DOWN"
+        else:
+            momentum = "↔️ FLAT"
+        
+        return {
+            'current_price': current_price,
+            'price_change_5': price_change_5,
+            'speed': speed,
+            'speed_score': speed_score,
+            'atr': atr,
+            'atr_percent': atr_percent,
+            'volatility': recent_volatility,
+            'current_spread': current_candle_spread,
+            'avg_spread': avg_spread,
+            'volume_ratio': volume_ratio,
+            'current_volume': current_volume,
+            'avg_volume': avg_volume_20,
+            'momentum': momentum,
+            'price_range_5': price_range_5
+        }
+    except Exception as e:
+        logger.error(f"Error analyzing speed: {e}")
+        return None
+
+# ============================================================================
+# VOLUME ANALYSIS - Before Indicators
+# ============================================================================
+
+def analyze_volume_profile(df: pd.DataFrame, speed_data: dict) -> dict:
+    """Analyze volume profile and accumulation/distribution"""
+    if df is None or speed_data is None:
+        return None
+    
+    try:
+        close = df['Close'].values
+        high = df['High'].values
+        low = df['Low'].values
+        volume = df['Volume'].values
+        
+        # On-Balance Volume (OBV)
+        obv = talib.OBV(close, volume)
+        obv_current = obv[-1]
+        obv_prev = obv[-2] if len(obv) > 1 else obv[-1]
+        obv_direction = "UP" if obv_current > obv_prev else "DOWN"
+        
+        # Accumulation/Distribution Line
+        ad_line = talib.AD(high, low, close, volume)
+        ad_current = ad_line[-1]
+        ad_prev = ad_line[-2] if len(ad_line) > 1 else ad_line[-1]
+        ad_direction = "ACCUM" if ad_current > ad_prev else "DISTRIB"
+        
+        # Volume trend (increasing or decreasing)
+        vol_trend = np.mean(volume[-5:]) / np.mean(volume[-10:-5]) if len(volume) >= 10 else 1
+        vol_trend_direction = "INCREASING" if vol_trend > 1.2 else "DECREASING" if vol_trend < 0.8 else "STABLE"
+        
+        # VWAP-like calculation (Volume Weighted)
+        typical_price = (high + low + close) / 3
+        vwap = np.sum(typical_price[-20:] * volume[-20:]) / np.sum(volume[-20:]) if len(volume) >= 20 else close[-1]
+        price_vs_vwap = "ABOVE" if close[-1] > vwap else "BELOW"
+        
+        # Volume spike detection
+        max_vol_20 = np.max(volume[-20:]) if len(volume) >= 20 else np.max(volume)
+        vol_spike = current_vol / max_vol_20 if (current_vol := volume[-1]) < max_vol_20 else volume[-1] / max_vol_20
+        spike_strength = "EXTREME" if vol_spike > 2.0 else "STRONG" if vol_spike > 1.5 else "NORMAL"
+        
+        return {
+            'obv': obv_current,
+            'obv_direction': obv_direction,
+            'ad_line': ad_current,
+            'ad_direction': ad_direction,
+            'vol_trend': vol_trend,
+            'vol_trend_direction': vol_trend_direction,
+            'vwap': vwap,
+            'price_vs_vwap': price_vs_vwap,
+            'vol_spike_ratio': vol_spike,
+            'spike_strength': spike_strength
+        }
+    except Exception as e:
+        logger.error(f"Error analyzing volume: {e}")
+        return None
+
+# ============================================================================
+# TECHNICAL INDICATORS - After Speed and Volume
+# ============================================================================
+
+def calculate_trading_indicators(df: pd.DataFrame) -> dict:
+    """Calculate focused trading indicators (RSI, MACD, Bollinger Bands)"""
+    if df is None or len(df) < 20:
+        return None
+    
+    try:
+        close = df['Close'].values
+        high = df['High'].values
+        low = df['Low'].values
+        
         # RSI (Relative Strength Index)
         rsi = talib.RSI(close, timeperiod=14)[-1]
+        rsi_signal = "OVERSOLD" if rsi < 30 else "OVERBOUGHT" if rsi > 70 else "NEUTRAL"
         
         # MACD (Moving Average Convergence Divergence)
         macd, signal, hist = talib.MACD(close, fastperiod=12, slowperiod=26, signalperiod=9)
-        macd_val = macd[-1]
-        macd_signal = signal[-1]
+        macd_current = macd[-1]
+        macd_signal_val = signal[-1]
         macd_hist = hist[-1]
+        
+        if len(macd) > 1:
+            macd_prev = macd[-2]
+            macd_crossover = "BULLISH" if macd_current > macd_signal_val and macd_prev <= signal[-2] else "BEARISH" if macd_current < macd_signal_val and macd_prev >= signal[-2] else "NEUTRAL"
+        else:
+            macd_crossover = "NEUTRAL"
         
         # Bollinger Bands
         bb_high, bb_mid, bb_low = talib.BBANDS(close, timeperiod=20, nbdevup=2, nbdevdn=2, matype=0)
-        current_price = close[-1]
         bb_high_val = bb_high[-1]
+        bb_mid_val = bb_mid[-1]
         bb_low_val = bb_low[-1]
-        bb_position = (current_price - bb_low_val) / (bb_high_val - bb_low_val) if (bb_high_val - bb_low_val) != 0 else 0.5
+        bb_position = (close[-1] - bb_low_val) / (bb_high_val - bb_low_val) if (bb_high_val - bb_low_val) != 0 else 0.5
         
-        # ADX (Average Directional Index)
-        adx = talib.ADX(high, low, close, timeperiod=14)[-1]
+        if bb_position > 0.8:
+            bb_signal = "OVERBOUGHT (Upper Band)"
+        elif bb_position < 0.2:
+            bb_signal = "OVERSOLD (Lower Band)"
+        else:
+            bb_signal = "NEUTRAL (Middle)"
         
-        # Stochastic RSI
+        # Moving Averages (Fast & Slow)
+        ema_9 = talib.EMA(close, timeperiod=9)[-1]
+        ema_21 = talib.EMA(close, timeperiod=21)[-1]
+        ma_cross = "BULLISH" if ema_9 > ema_21 else "BEARISH"
+        
+        # Stochastic RSI (for fast confirmation)
         stoch_rsi = talib.STOCHRSI(close, timeperiod=14, fastk_period=3, fastd_period=3, fastd_matype=0)
-        stoch_k = stoch_rsi[2][-1] * 100  # FastK
-        stoch_d = stoch_rsi[3][-1] * 100  # FastD
-        
-        # CCI (Commodity Channel Index)
-        cci = talib.CCI(high, low, close, timeperiod=20)[-1]
-        
-        # Volume analysis
-        avg_volume = np.mean(volume[-20:])
-        current_volume = volume[-1]
-        volume_ratio = current_volume / avg_volume if avg_volume > 0 else 1
-        
-        # Volume SMA
-        volume_sma = talib.SMA(volume, timeperiod=20)[-1]
-        volume_trend = (current_volume - volume_sma) / volume_sma * 100 if volume_sma > 0 else 0
-        
-        # Price momentum
-        price_change_5d = ((close[-1] - close[-5]) / close[-5] * 100) if len(close) >= 5 else 0
-        price_change_1d = ((close[-1] - close[-2]) / close[-2] * 100) if len(close) >= 2 else 0
-        
-        # Moving averages
-        ma_20 = talib.SMA(close, timeperiod=20)[-1]
-        ma_50 = talib.SMA(close, timeperiod=50)[-1]
-        ma_200 = talib.SMA(close, timeperiod=200)[-1] if len(close) >= 200 else ma_50
-        
-        # 52-week high/low
-        high_52w = np.max(high[-252:]) if len(high) >= 252 else np.max(high)
-        low_52w = np.min(low[-252:]) if len(low) >= 252 else np.min(low)
-        high_low_position = (current_price - low_52w) / (high_52w - low_52w) * 100 if (high_52w - low_52w) != 0 else 50
-        
-        # ATR (Average True Range)
-        atr = talib.ATR(high, low, close, timeperiod=14)[-1]
-        atr_percent = (atr / current_price) * 100
+        stoch_k = stoch_rsi[2][-1] * 100 if len(stoch_rsi[2]) > 0 else 50
+        stoch_d = stoch_rsi[3][-1] * 100 if len(stoch_rsi[3]) > 0 else 50
+        stoch_signal = "OVERSOLD" if stoch_k < 20 else "OVERBOUGHT" if stoch_k > 80 else "NEUTRAL"
         
         return {
             'rsi': rsi,
-            'macd': macd_val,
-            'macd_signal': macd_signal,
+            'rsi_signal': rsi_signal,
+            'macd': macd_current,
+            'macd_signal': macd_signal_val,
             'macd_hist': macd_hist,
-            'bb_position': bb_position,
+            'macd_crossover': macd_crossover,
             'bb_high': bb_high_val,
+            'bb_mid': bb_mid_val,
             'bb_low': bb_low_val,
-            'adx': adx,
+            'bb_position': bb_position,
+            'bb_signal': bb_signal,
+            'ema_9': ema_9,
+            'ema_21': ema_21,
+            'ma_cross': ma_cross,
             'stoch_k': stoch_k,
             'stoch_d': stoch_d,
-            'cci': cci,
-            'volume_ratio': volume_ratio,
-            'volume_trend': volume_trend,
-            'price_change_5d': price_change_5d,
-            'price_change_1d': price_change_1d,
-            'ma_20': ma_20,
-            'ma_50': ma_50,
-            'ma_200': ma_200,
-            'high_52w': high_52w,
-            'low_52w': low_52w,
-            'high_low_position': high_low_position,
-            'current_price': current_price,
-            'avg_volume': avg_volume,
-            'current_volume': current_volume,
-            'atr': atr,
-            'atr_percent': atr_percent
+            'stoch_signal': stoch_signal
         }
     except Exception as e:
         logger.error(f"Error calculating indicators: {e}")
         return None
 
-def determine_state(indicators: Dict, rsi_low: int, rsi_high: int, vol_mult: float) -> Tuple[str, int, List[str]]:
-    """Determine momentum state based on technical indicators"""
-    if indicators is None:
-        return "ERROR", 0, []
+# ============================================================================
+# TRADE SIGNAL GENERATION
+# ============================================================================
+
+def generate_trade_signal(speed_data: dict, volume_data: dict, indicators: dict) -> tuple:
+    """Generate trade signals: BUY or SELL with confidence"""
+    if not all([speed_data, volume_data, indicators]):
+        return "WAIT", 0, []
     
+    signals = []
     score = 0
-    reasons = []
     
-    # RSI signals (range: -30 to +30)
-    rsi = indicators['rsi']
-    if rsi < rsi_low:
-        score += 25
-        reasons.append(f"RSI Oversold ({rsi:.1f})")
-    elif rsi > rsi_high:
+    # SPEED CHECK (Primary)
+    if speed_data['speed'] == "🔥 HOT":
+        score += 30
+        signals.append(f"🔥 SPEED: {speed_data['speed']} (ATR: {speed_data['atr_percent']:.2f}%)")
+    elif speed_data['speed'] == "⚠️ WARM":
         score += 15
-        reasons.append(f"RSI Overbought ({rsi:.1f})")
-    else:
-        score += 5
+        signals.append(f"⚠️ SPEED: {speed_data['speed']} (ATR: {speed_data['atr_percent']:.2f}%)")
     
-    # MACD signals (range: -15 to +15)
-    if indicators['macd_hist'] > 0 and indicators['macd'] > indicators['macd_signal']:
-        score += 15
-        reasons.append("MACD Bullish")
-    elif indicators['macd_hist'] < 0 and indicators['macd'] < indicators['macd_signal']:
-        score -= 10
-        reasons.append("MACD Bearish")
-    
-    # Bollinger Bands signals (range: -20 to +20)
-    bb_pos = indicators['bb_position']
-    if bb_pos > 0.8:
-        score += 10
-        reasons.append("Upper BB (Overextended)")
-    elif bb_pos < 0.2:
-        score += 15
-        reasons.append("Lower BB (Reversal Setup)")
-    
-    # Volume signals (range: -10 to +20)
-    vol_ratio = indicators['volume_ratio']
-    if vol_ratio > vol_mult:
+    # VOLUME CHECK (Primary)
+    if volume_data['spike_strength'] == "EXTREME":
+        score += 35
+        signals.append(f"📊 VOLUME: {volume_data['spike_strength']} SPIKE ({volume_data['vol_spike_ratio']:.1f}x)")
+    elif volume_data['spike_strength'] == "STRONG":
         score += 20
-        reasons.append(f"Volume Spike ({vol_ratio:.1f}x)")
-    elif vol_ratio > 1.5:
-        score += 10
-        reasons.append(f"High Volume ({vol_ratio:.1f}x)")
+        signals.append(f"📊 VOLUME: {volume_data['spike_strength']} ({volume_data['vol_spike_ratio']:.1f}x)")
     
-    # Trend strength (ADX) - range: -5 to +10
-    adx = indicators['adx']
-    if adx > 25:
-        score += 10
-        reasons.append(f"Strong Trend (ADX: {adx:.1f})")
-    
-    # Price momentum (range: -10 to +15)
-    price_change = indicators['price_change_5d']
-    if price_change > 5:
+    # VOLUME DIRECTION
+    if volume_data['obv_direction'] == "UP":
         score += 15
-        reasons.append(f"Strong Momentum (+{price_change:.1f}%)")
-    elif price_change < -5:
+        signals.append(f"📈 OBV: Accumulation")
+    elif volume_data['ad_direction'] == "ACCUM":
+        score += 10
+        signals.append(f"💰 A/D: Accumulation")
+    
+    # PRICE vs VWAP
+    if speed_data['momentum'] == "📈 UP" and volume_data['price_vs_vwap'] == "ABOVE":
+        score += 20
+        signals.append(f"⬆️ PRICE ABOVE VWAP + UPTREND")
+    elif speed_data['momentum'] == "📉 DOWN" and volume_data['price_vs_vwap'] == "BELOW":
+        score += 20
+        signals.append(f"⬇️ PRICE BELOW VWAP + DOWNTREND")
+    
+    # INDICATOR CONFIRMATION (Secondary)
+    if indicators['macd_crossover'] == "BULLISH":
+        score += 15
+        signals.append(f"✅ MACD: Bullish Crossover")
+    elif indicators['macd_crossover'] == "BEARISH":
+        score -= 10
+        signals.append(f"❌ MACD: Bearish Crossover")
+    
+    if indicators['ma_cross'] == "BULLISH":
+        score += 10
+        signals.append(f"✅ EMA: 9 > 21 (Bullish)")
+    elif indicators['ma_cross'] == "BEARISH":
         score -= 5
-        reasons.append(f"Negative Momentum ({price_change:.1f}%)")
+        signals.append(f"❌ EMA: 9 < 21 (Bearish)")
     
-    # 52-week position (range: -5 to +10)
-    hl_pos = indicators['high_low_position']
-    if hl_pos > 75:
-        score += 10
-        reasons.append(f"Near 52w High ({hl_pos:.1f}%)")
-    elif hl_pos < 25:
-        score += 5
-        reasons.append(f"Near 52w Low ({hl_pos:.1f}%)")
+    # RSI Confirmation
+    if indicators['rsi_signal'] == "OVERSOLD":
+        score += 20
+        signals.append(f"🔽 RSI: Oversold ({indicators['rsi']:.0f})")
+    elif indicators['rsi_signal'] == "OVERBOUGHT":
+        score -= 15
+        signals.append(f"🔼 RSI: Overbought ({indicators['rsi']:.0f})")
     
-    # Stochastic RSI signals (range: -5 to +10)
-    stoch_k = indicators['stoch_k']
-    if stoch_k < 20:
-        score += 10
-        reasons.append(f"Stoch Oversold ({stoch_k:.1f})")
-    elif stoch_k > 80:
-        score += 5
+    # Bollinger Bands
+    if indicators['bb_signal'] == "OVERSOLD (Lower Band)":
+        score += 15
+        signals.append(f"📌 BB: At Lower Band (Reversal)")
+    elif indicators['bb_signal'] == "OVERBOUGHT (Upper Band)":
+        score -= 10
+        signals.append(f"📌 BB: At Upper Band")
     
-    # Determine state
-    if score >= 80:
-        state = "🔥 ACTIVE"
-    elif score >= 50:
-        state = "👀 WATCH"
+    # Determine Signal
+    if score >= 70:
+        signal = "🟢 BUY"
+    elif score <= -30:
+        signal = "🔴 SELL"
     else:
-        state = "⚠️ NOISE"
+        signal = "⚪ HOLD"
     
-    return state, score, reasons
-
-def create_price_chart(df: pd.DataFrame, ticker: str) -> Optional[go.Figure]:
-    """Create candlestick chart with moving averages"""
-    if df is None or len(df) < 20:
-        return None
-    
-    try:
-        df_copy = df.copy()
-        df_copy['MA20'] = df_copy['Close'].rolling(window=20).mean()
-        df_copy['MA50'] = df_copy['Close'].rolling(window=50).mean()
-        
-        fig = go.Figure()
-        
-        # Candlestick
-        fig.add_trace(go.Candlestick(
-            x=df_copy.index,
-            open=df_copy['Open'],
-            high=df_copy['High'],
-            low=df_copy['Low'],
-            close=df_copy['Close'],
-            name=ticker,
-        ))
-        
-        # Moving averages
-        fig.add_trace(go.Scatter(
-            x=df_copy.index, y=df_copy['MA20'],
-            name='MA20', line=dict(color='orange', width=1),
-            hovertemplate='<b>MA20</b><br>%{y:.2f}<extra></extra>'
-        ))
-        
-        fig.add_trace(go.Scatter(
-            x=df_copy.index, y=df_copy['MA50'],
-            name='MA50', line=dict(color='blue', width=1),
-            hovertemplate='<b>MA50</b><br>%{y:.2f}<extra></extra>'
-        ))
-        
-        fig.update_layout(
-            title=f"{ticker} - Price Action",
-            yaxis_title="Price ($)",
-            xaxis_title="Date",
-            template="plotly_dark",
-            height=500,
-            hovermode='x unified',
-            xaxis_rangeslider_visible=False
-        )
-        
-        return fig
-    except Exception as e:
-        logger.error(f"Error creating chart: {e}")
-        return None
-
-def create_rsi_chart(df: pd.DataFrame, ticker: str) -> Optional[go.Figure]:
-    """Create RSI indicator chart"""
-    if df is None or len(df) < 14:
-        return None
-    
-    try:
-        close = df['Close'].values
-        rsi = talib.RSI(close, timeperiod=14)
-        
-        fig = go.Figure()
-        
-        fig.add_trace(go.Scatter(
-            x=df.index, y=rsi,
-            name='RSI(14)', line=dict(color='purple', width=2),
-            fill='tozeroy'
-        ))
-        
-        # Overbought/Oversold lines
-        fig.add_hline(y=70, line_dash="dash", line_color="red", annotation_text="Overbought (70)")
-        fig.add_hline(y=30, line_dash="dash", line_color="green", annotation_text="Oversold (30)")
-        
-        fig.update_layout(
-            title=f"{ticker} - RSI(14)",
-            yaxis_title="RSI",
-            xaxis_title="Date",
-            template="plotly_dark",
-            height=350,
-            hovermode='x unified',
-            yaxis=dict(range=[0, 100])
-        )
-        
-        return fig
-    except Exception as e:
-        logger.error(f"Error creating RSI chart: {e}")
-        return None
-
-def create_volume_chart(df: pd.DataFrame, ticker: str) -> Optional[go.Figure]:
-    """Create volume chart"""
-    if df is None:
-        return None
-    
-    try:
-        df_copy = df.copy()
-        df_copy['MA_Vol'] = df_copy['Volume'].rolling(window=20).mean()
-        
-        colors = ['green' if row['Close'] >= row['Open'] else 'red' for idx, row in df_copy.iterrows()]
-        
-        fig = go.Figure()
-        
-        fig.add_trace(go.Bar(
-            x=df_copy.index, y=df_copy['Volume'],
-            name='Volume', marker_color=colors,
-            hovertemplate='<b>Volume</b><br>%{y:.0f}<extra></extra>'
-        ))
-        
-        fig.add_trace(go.Scatter(
-            x=df_copy.index, y=df_copy['MA_Vol'],
-            name='MA20', line=dict(color='yellow', width=2),
-            hovertemplate='<b>MA20 Vol</b><br>%{y:.0f}<extra></extra>'
-        ))
-        
-        fig.update_layout(
-            title=f"{ticker} - Volume",
-            yaxis_title="Volume",
-            xaxis_title="Date",
-            template="plotly_dark",
-            height=350,
-            hovermode='x unified',
-            showlegend=True
-        )
-        
-        return fig
-    except Exception as e:
-        logger.error(f"Error creating volume chart: {e}")
-        return None
+    return signal, score, signals
 
 # ============================================================================
 # APP HEADER
 # ============================================================================
 
-col1, col2 = st.columns([3, 1])
+market_status, now = get_market_status()
+
+col1, col2, col3 = st.columns([2, 2, 1])
 with col1:
-    st.title("🚀 Momentum Activation Engine")
-    st.subheader("Real-Time Small-Cap Runner Detector")
+    st.title("⚡ DAY TRADER ENGINE")
+    st.subheader("Pre-Market to 8PM • 1min | 5min | 15min")
 with col2:
-    st.metric("Last Scan", datetime.now().strftime("%H:%M:%S"))
+    status_color = "🟢" if market_status == "OPEN" else "🔴"
+    st.write(f"### {status_color} {market_status}")
+    st.write(f"{now.strftime('%I:%M %p ET')}")
+with col3:
+    st.metric("Last Update", now.strftime("%H:%M:%S"))
+
+st.divider()
 
 # ============================================================================
 # SIDEBAR CONFIGURATION
 # ============================================================================
 
 with st.sidebar:
-    st.header("⚙️ Configuration")
+    st.header("⚡ FAST EXECUTION SETUP")
     
-    scan_type = st.radio(
-        "Scan Type",
-        ["Manual Tickers", "Top Gainers", "Top Losers", "Most Active"],
-        help="Choose how to populate ticker list"
+    st.markdown("### 📊 TIMEFRAMES (Pick 1+)")
+    timeframes = st.multiselect(
+        "Select candle timeframes",
+        ["1m", "5m", "15m"],
+        default=["1m", "5m"],
+        help="1m = Ultra-fast, 5m = Standard, 15m = Confirmation"
     )
     
-    timeframe = st.selectbox(
-        "Analysis Timeframe",
-        ["1d", "5d", "1mo", "3mo", "6mo", "1y"],
-        help="Historical period for technical analysis",
-        index=2
-    )
+    if not timeframes:
+        timeframes = ["1m"]
     
-    st.markdown("### Technical Thresholds")
-    rsi_threshold_low = st.slider("RSI Oversold", 0, 50, 30, help="Lower = more oversold signals")
-    rsi_threshold_high = st.slider("RSI Overbought", 50, 100, 70, help="Higher = more overbought signals")
-    volume_multiplier = st.slider("Volume Spike", 1.0, 5.0, 2.0, 0.1, help="Volume multiple above average")
+    st.markdown("### ⚙️ SPEED THRESHOLDS")
+    atr_threshold = st.slider("ATR% Minimum for 🔥 HOT", 0.5, 5.0, 2.0, 0.1)
+    vol_multiple = st.slider("Volume Spike Multiple", 1.0, 5.0, 1.5, 0.1)
     
-    st.markdown("### Display Options")
-    show_charts = st.checkbox("Show Technical Charts", value=True)
-    show_details = st.checkbox("Show Detailed Analysis", value=True)
-    show_alerts = st.checkbox("Show Trade Alerts", value=True)
+    st.markdown("### 🎯 SIGNAL SETTINGS")
+    min_signal_score = st.slider("Min Signal Score", 30, 100, 60, 10)
+    
+    st.markdown("### 📈 ANALYSIS ORDER")
+    st.write("1️⃣ **SPEED** (ATR, Volatility)")
+    st.write("2️⃣ **SPREAD** (Bid-Ask width)")
+    st.write("3️⃣ **VOLUME** (Spikes, OBV, A/D)")
+    st.write("4️⃣ **INDICATORS** (RSI, MACD, BB)")
 
 # ============================================================================
 # TICKER INPUT
@@ -440,247 +460,198 @@ with st.sidebar:
 
 st.divider()
 
-if scan_type == "Manual Tickers":
+col1, col2 = st.columns([3, 1])
+with col1:
     tickers_input = st.text_input(
-        "Enter tickers (comma separated)",
-        value="PLTR,MSTR,COIN,MARA,RIOT,SOFI,HYLN,RGTI,NVTS",
-        placeholder="E.g., AAPL,MSFT,TSLA"
+        "Enter Tickers (comma-separated) - DAY TRADING STOCKS",
+        value="PLTR,MSTR,NVDA,AMD,SOFI,F,GME,AMC,TSLA",
+        placeholder="E.g., PLTR,MSTR,AMD"
     )
-    tickers = [t.strip().upper() for t in tickers_input.split(",") if t.strip()]
-else:
-    # Default top movers for demo
-    if scan_type == "Top Gainers":
-        tickers = ["NVDA", "MSTR", "PLTR", "MARA", "RIOT", "COIN", "SOFI", "GME"]
-    elif scan_type == "Top Losers":
-        tickers = ["F", "BAC", "WFC", "GE", "X", "AA", "PBR", "VALE"]
-    else:  # Most Active
-        tickers = ["SPY", "QQQ", "IWM", "XLF", "XLE", "GLD", "TLT", "VIX"]
-    
-    st.info(f"📊 Scanning {len(tickers)} {scan_type.lower()}")
+with col2:
+    scan_button = st.button("⚡ EXECUTE SCAN", use_container_width=True, type="primary")
+
+tickers = [t.strip().upper() for t in tickers_input.split(",") if t.strip()]
 
 # ============================================================================
-# SCAN BUTTON & RESULTS
+# MAIN SCAN & ANALYSIS
 # ============================================================================
 
-if st.button("🔍 SCAN MOMENTUM", use_container_width=True, type="primary"):
+if scan_button:
     if not tickers:
-        st.error("Please enter at least one ticker")
+        st.error("❌ Enter at least one ticker")
     else:
+        st.subheader("⚡ SCANNING...")
+        
         results = []
         progress_bar = st.progress(0)
         status_text = st.empty()
         
-        for idx, ticker in enumerate(tickers):
-            status_text.text(f"📡 Scanning {ticker}... ({idx+1}/{len(tickers)})")
-            
-            try:
-                # Fetch data
-                df = fetch_stock_data(ticker, period=timeframe)
-                if df is None:
-                    continue
+        total_items = len(tickers) * len(timeframes)
+        current = 0
+        
+        for ticker_idx, ticker in enumerate(tickers):
+            for tf_idx, timeframe in enumerate(timeframes):
+                current += 1
+                status_text.text(f"🔍 {ticker} ({timeframe}) - {current}/{total_items}")
                 
-                # Calculate indicators
-                indicators = calculate_indicators(df)
-                if indicators is None:
-                    continue
+                try:
+                    # Fetch data
+                    df = fetch_intraday_data(ticker, interval=timeframe, period="1d")
+                    if df is None or len(df) < 20:
+                        continue
+                    
+                    # Analyze in order: SPEED → SPREAD → VOLUME → INDICATORS
+                    speed_data = analyze_speed_and_price(df)
+                    volume_data = analyze_volume_profile(df, speed_data)
+                    indicators = calculate_trading_indicators(df)
+                    
+                    if not all([speed_data, volume_data, indicators]):
+                        continue
+                    
+                    # Generate signal
+                    signal, score, signal_reasons = generate_trade_signal(speed_data, volume_data, indicators)
+                    
+                    # Only show qualified signals
+                    if score >= min_signal_score or signal != "⚪ HOLD":
+                        results.append({
+                            'Ticker': ticker,
+                            'Timeframe': timeframe,
+                            'Signal': signal,
+                            'Score': score,
+                            'Price': f"${speed_data['current_price']:.2f}",
+                            'Speed': speed_data['speed'],
+                            'ATR%': f"{speed_data['atr_percent']:.2f}%",
+                            'Spread': f"{speed_data['current_spread']:.3f}%",
+                            'Volume': f"{speed_data['volume_ratio']:.1f}x",
+                            'RSI': f"{indicators['rsi']:.0f}",
+                            'MACD': indicators['macd_crossover'],
+                            'BB': indicators['bb_signal'],
+                            'Reasons': signal_reasons,
+                            'Data': df,
+                            'Speed': speed_data,
+                            'Volume': volume_data,
+                            'Indicators': indicators
+                        })
+                    
+                except Exception as e:
+                    logger.error(f"Error processing {ticker} {timeframe}: {e}")
                 
-                # Determine state
-                state, score, reasons = determine_state(
-                    indicators, 
-                    rsi_threshold_low, 
-                    rsi_threshold_high,
-                    volume_multiplier
-                )
-                
-                results.append({
-                    'Ticker': ticker,
-                    'State': state,
-                    'Score': score,
-                    'Price': indicators['current_price'],
-                    'Change 1D': indicators['price_change_1d'],
-                    'Change 5D': indicators['price_change_5d'],
-                    'RSI': indicators['rsi'],
-                    'Volume Ratio': indicators['volume_ratio'],
-                    'ADX': indicators['adx'],
-                    'MACD': indicators['macd_hist'],
-                    'Reasons': reasons,
-                    'Chart': df,
-                    'Indicators': indicators,
-                })
-                
-            except Exception as e:
-                logger.error(f"Error processing {ticker}: {e}")
-            
-            progress_bar.progress((idx + 1) / len(tickers))
+                progress_bar.progress(current / total_items)
         
         status_text.empty()
         progress_bar.empty()
         
         if results:
-            # Sort by score
+            # Sort by score (highest first)
             results_sorted = sorted(results, key=lambda x: x['Score'], reverse=True)
             
-            # ====== RESULTS TABLE ======
-            st.subheader("📊 Scan Results")
+            # ====== QUICK SCAN TABLE ======
+            st.subheader("⚡ LIVE SCAN RESULTS")
             
-            display_df = pd.DataFrame([
-                {
+            display_data = []
+            for r in results_sorted:
+                signal_color = "🟢" if "BUY" in r['Signal'] else "🔴" if "SELL" in r['Signal'] else "⚪"
+                display_data.append({
+                    'Signal': f"{signal_color} {r['Signal']}",
                     'Ticker': r['Ticker'],
-                    'State': r['State'],
+                    'TF': r['Timeframe'],
                     'Score': r['Score'],
-                    'Price': f"${r['Price']:.2f}",
-                    'Change 1D': f"{r['Change 1D']:+.1f}%",
-                    'Change 5D': f"{r['Change 5D']:+.1f}%",
-                    'RSI': f"{r['RSI']:.0f}",
-                    'Vol': f"{r['Volume Ratio']:.1f}x",
-                    'ADX': f"{r['ADX']:.0f}",
-                }
-                for r in results_sorted
-            ])
+                    'Price': r['Price'],
+                    'Speed': r['Speed'],
+                    'ATR%': r['ATR%'],
+                    'Spread': r['Spread'],
+                    'Volume': r['Volume'],
+                    'RSI': r['RSI'],
+                    'MACD': r['MACD'],
+                })
             
-            def style_state(val):
-                if '🔥' in str(val):
-                    return 'background-color: #d4edda; color: #155724; font-weight: bold'
-                elif '👀' in str(val):
-                    return 'background-color: #fff3cd; color: #856404; font-weight: bold'
-                else:
-                    return 'background-color: #f8d7da; color: #721c24; font-weight: bold'
+            display_df = pd.DataFrame(display_data)
+            st.dataframe(display_df, use_container_width=True, hide_index=True)
             
-            styled_df = display_df.style.applymap(style_state, subset=['State'])
-            st.dataframe(styled_df, use_container_width=True, hide_index=True)
-            
-            # ====== SUMMARY METRICS ======
-            col1, col2, col3, col4 = st.columns(4)
-            active_count = sum(1 for r in results if '🔥' in r['State'])
-            watch_count = sum(1 for r in results if '👀' in r['State'])
-            noise_count = sum(1 for r in results if '⚠️' in r['State'])
+            # ====== STATISTICS ======
+            col1, col2, col3, col4, col5 = st.columns(5)
+            buy_count = sum(1 for r in results if "BUY" in r['Signal'])
+            sell_count = sum(1 for r in results if "SELL" in r['Signal'])
+            hold_count = sum(1 for r in results if "HOLD" in r['Signal'])
             avg_score = np.mean([r['Score'] for r in results])
+            avg_volume = np.mean([float(r['Volume'].split('x')[0]) for r in results])
             
             with col1:
-                st.metric("🔥 Active", active_count, delta=f"{(active_count/len(results)*100):.0f}%")
+                st.metric("🟢 BUY Signals", buy_count)
             with col2:
-                st.metric("👀 Watch", watch_count, delta=f"{(watch_count/len(results)*100):.0f}%")
+                st.metric("🔴 SELL Signals", sell_count)
             with col3:
-                st.metric("⚠️ Noise", noise_count, delta=f"{(noise_count/len(results)*100):.0f}%")
+                st.metric("⚪ HOLD", hold_count)
             with col4:
-                st.metric("📈 Avg Score", f"{avg_score:.0f}", delta="Overall")
+                st.metric("📊 Avg Score", f"{avg_score:.0f}")
+            with col5:
+                st.metric("📈 Avg Vol", f"{avg_volume:.1f}x")
             
-            # ====== DETAILED ANALYSIS ======
-            if show_details:
-                st.subheader("🔬 Detailed Analysis")
-                
-                for result in results_sorted:
-                    with st.expander(f"{result['Ticker']} - {result['State']} (Score: {result['Score']})", expanded=False):
-                        tab1, tab2, tab3, tab4 = st.tabs(["Overview", "Charts", "Indicators", "Analysis"])
-                        
-                        with tab1:
-                            col1, col2, col3 = st.columns(3)
-                            
-                            with col1:
-                                st.metric("Price", f"${result['Price']:.2f}")
-                                st.metric("RSI(14)", f"{result['RSI']:.1f}")
-                                st.metric("Score", result['Score'])
-                            
-                            with col2:
-                                st.metric("1D Change", f"{result['Change 1D']:+.1f}%")
-                                st.metric("5D Change", f"{result['Change 5D']:+.1f}%")
-                                st.metric("Volume", f"{result['Volume Ratio']:.1f}x")
-                            
-                            with col3:
-                                ind = result['Indicators']
-                                st.metric("ADX", f"{ind['adx']:.1f}")
-                                st.metric("MACD", f"{ind['macd_hist']:.4f}")
-                                st.metric("BB Pos", f"{ind['bb_position']:.0%}")
-                        
-                        with tab2:
-                            if show_charts:
-                                chart1 = create_price_chart(result['Chart'], result['Ticker'])
-                                if chart1:
-                                    st.plotly_chart(chart1, use_container_width=True)
-                                
-                                col1, col2 = st.columns(2)
-                                with col1:
-                                    chart2 = create_rsi_chart(result['Chart'], result['Ticker'])
-                                    if chart2:
-                                        st.plotly_chart(chart2, use_container_width=True)
-                                with col2:
-                                    chart3 = create_volume_chart(result['Chart'], result['Ticker'])
-                                    if chart3:
-                                        st.plotly_chart(chart3, use_container_width=True)
-                        
-                        with tab3:
-                            ind = result['Indicators']
-                            col1, col2 = st.columns(2)
-                            
-                            with col1:
-                                st.write("**Momentum Indicators**")
-                                st.write(f"RSI: {ind['rsi']:.2f}")
-                                st.write(f"Stoch RSI K: {ind['stoch_k']:.2f}")
-                                st.write(f"CCI: {ind['cci']:.2f}")
-                                st.write(f"MACD Histogram: {ind['macd_hist']:.4f}")
-                            
-                            with col2:
-                                st.write("**Volatility & Trend**")
-                                st.write(f"ADX: {ind['adx']:.2f}")
-                                st.write(f"ATR: ${ind['atr']:.2f} ({ind['atr_percent']:.2f}%)")
-                                st.write(f"BB Position: {ind['bb_position']:.0%}")
-                                st.write(f"52w Position: {ind['high_low_position']:.1f}%")
-                        
-                        with tab4:
-                            st.write("**Analysis Signals:**")
-                            for reason in result['Reasons']:
-                                st.write(f"• {reason}")
+            # ====== DETAILED TRADE ANALYSIS ======
+            st.subheader("📊 DETAILED TRADE SETUPS")
             
-            # ====== TRADE ALERTS ======
-            if show_alerts:
-                st.subheader("🚨 Trade Alerts")
-                
-                active_tickers = [r for r in results_sorted if '🔥' in r['State']]
-                
-                if active_tickers:
-                    for ticker_result in active_tickers[:3]:  # Top 3 active
-                        with st.container():
-                            ind = ticker_result['Indicators']
-                            col1, col2 = st.columns([3, 1])
-                            
-                            with col1:
-                                st.write(f"### {ticker_result['Ticker']}")
-                                
-                                # Entry signals
-                                entry_signals = []
-                                if ind['rsi'] < rsi_threshold_low:
-                                    entry_signals.append("✅ RSI Oversold - Buy Signal")
-                                if ind['volume_ratio'] > volume_multiplier:
-                                    entry_signals.append(f"✅ Volume Spike - {ind['volume_ratio']:.1f}x")
-                                if ind['macd_hist'] > 0:
-                                    entry_signals.append("✅ MACD Bullish Crossover")
-                                
-                                for signal in entry_signals:
-                                    st.success(signal)
-                                
-                                # Risk management
-                                st.write(f"**Support:** ${ind['bb_low']:.2f}")
-                                st.write(f"**Resistance:** ${ind['bb_high']:.2f}")
-                                st.write(f"**Risk/Reward:** {abs(ind['current_price'] - ind['bb_low']) / abs(ind['bb_high'] - ind['current_price']):.2f}")
-                            
-                            with col2:
-                                st.metric("Score", ticker_result['Score'], delta="High Priority")
-                            
-                            st.divider()
-                else:
-                    st.info("No active trade signals at this time.")
+            for result in results_sorted[:10]:  # Top 10 setups
+                with st.expander(
+                    f"{result['Signal']} {result['Ticker']} ({result['Timeframe']}) - Score: {result['Score']} - ${result['Price']}",
+                    expanded=False
+                ):
+                    # Create columns for analysis
+                    col1, col2, col3 = st.columns(3)
+                    
+                    with col1:
+                        st.write("**⚡ SPEED**")
+                        st.write(f"Status: {result['Speed']['speed']}")
+                        st.write(f"ATR: {result['Speed']['atr_percent']:.2f}%")
+                        st.write(f"Volatility: {result['Speed']['volatility']:.2f}%")
+                        st.write(f"Momentum: {result['Speed']['momentum']}")
+                    
+                    with col2:
+                        st.write("**📊 VOLUME & SPREAD**")
+                        st.write(f"Volume Ratio: {result['Speed']['volume_ratio']:.2f}x")
+                        st.write(f"Spread: {result['Speed']['current_spread']:.3f}%")
+                        st.write(f"OBV: {result['Volume']['obv_direction']}")
+                        st.write(f"A/D: {result['Volume']['ad_direction']}")
+                        st.write(f"Spike: {result['Volume']['spike_strength']}")
+                    
+                    with col3:
+                        st.write("**📈 INDICATORS**")
+                        st.write(f"RSI: {result['Indicators']['rsi']:.0f} ({result['Indicators']['rsi_signal']})")
+                        st.write(f"MACD: {result['Indicators']['macd_crossover']}")
+                        st.write(f"EMA: {result['Indicators']['ma_cross']}")
+                        st.write(f"Stoch: {result['Indicators']['stoch_k']:.0f} ({result['Indicators']['stoch_signal']})")
+                    
+                    st.divider()
+                    
+                    # Trade setup and reasons
+                    st.write("**🎯 TRADE SETUP REASONS:**")
+                    for reason in result['Reasons']:
+                        st.write(f"✓ {reason}")
+                    
+                    # Entry/Exit levels
+                    speed = result['Speed']
+                    indicators = result['Indicators']
+                    
+                    col1, col2, col3 = st.columns(3)
+                    with col1:
+                        st.write("**ENTRY:**")
+                        st.write(f"Price: ${speed['current_price']:.2f}")
+                    with col2:
+                        st.write("**SUPPORT:**")
+                        st.write(f"${indicators['bb_low']:.2f}")
+                    with col3:
+                        st.write("**RESISTANCE:**")
+                        st.write(f"${indicators['bb_high']:.2f}")
+        
         else:
-            st.error("❌ No valid data retrieved for the given tickers")
-
-# ============================================================================
-# FOOTER
-# ============================================================================
+            st.warning("⏳ No strong signals found. Adjust thresholds or wait for better setup.")
 
 st.divider()
+
+# Footer
 col1, col2, col3 = st.columns(3)
 with col1:
-    st.caption(f"📡 Updated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S UTC')}")
+    st.caption(f"⏰ {now.strftime('%I:%M:%S %p ET')} | Market: {market_status}")
 with col2:
-    st.caption("🔄 Real-time market data via Yahoo Finance")
+    st.caption("🔄 Refresh: 60s | Real-time Yahoo Finance")
 with col3:
-    st.caption("⚠️ Disclaimer: Not financial advice - Educational use only")
+    st.caption("⚠️ Not financial advice - Day trading risk")
