@@ -1,0 +1,9 @@
+pip-index-packages
+streamlit
+pandas
+numpy
+yfinance
+plotly
+requests
+python-dateutil
+pytz
