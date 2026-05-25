@@ -84,12 +84,12 @@ def get_market_status():
         return "CLOSED", now
 
 # ============================================================================
-# FAST DATA FETCHING - 1min, 5min, 15min
+# FAST DATA FETCHING - 1min, 5min, 15min with 24hr tracking
 # ============================================================================
 
 @st.cache_data(ttl=60)  # Refresh every 60 seconds for day trading
 def fetch_intraday_data(ticker: str, interval: str = "1m", period: str = "1d") -> pd.DataFrame:
-    """Fetch ultra-fast intraday data (1m, 5m, 15m candles)"""
+    """Fetch ultra-fast intraday data (1m, 5m, 15m candles) with pre/post market"""
     try:
         data = yf.download(
             ticker, 
@@ -107,6 +107,71 @@ def fetch_intraday_data(ticker: str, interval: str = "1m", period: str = "1d") -
         return data
     except Exception as e:
         logger.error(f"Error fetching {interval} data for {ticker}: {e}")
+        return None
+
+@st.cache_data(ttl=300)  # 5min cache for daily data
+def fetch_daily_data(ticker: str, period: str = "5d") -> pd.DataFrame:
+    """Fetch daily data for 24hr high/low tracking"""
+    try:
+        data = yf.download(
+            ticker,
+            interval="1d",
+            period=period,
+            progress=False,
+            threads=False
+        )
+        if len(data) == 0:
+            return None
+        
+        data['Timestamp'] = data.index
+        return data
+    except Exception as e:
+        logger.error(f"Error fetching daily data for {ticker}: {e}")
+        return None
+
+# ============================================================================
+# 24HR PRICE TRACKING
+# ============================================================================
+
+def analyze_24hr_price_movement(ticker: str, intraday_df: pd.DataFrame, daily_df: pd.DataFrame) -> dict:
+    """Analyze 24-hour price action and daily levels"""
+    try:
+        if intraday_df is None or daily_df is None:
+            return None
+        
+        current_price = intraday_df['Close'].iloc[-1]
+        
+        # 24hr High/Low from daily data
+        daily_24h_high = daily_df['High'].iloc[-1]
+        daily_24h_low = daily_df['Low'].iloc[-1]
+        daily_open = daily_df['Open'].iloc[-1]
+        daily_close_prev = daily_df['Close'].iloc[-2] if len(daily_df) > 1 else daily_df['Close'].iloc[-1]
+        
+        # Today's movement
+        today_change = ((current_price - daily_open) / daily_open) * 100
+        prev_close_change = ((current_price - daily_close_prev) / daily_close_prev) * 100
+        
+        # Distance to levels (% away)
+        dist_to_high = ((daily_24h_high - current_price) / current_price) * 100
+        dist_to_low = ((current_price - daily_24h_low) / current_price) * 100
+        
+        # Price position in range
+        range_size = daily_24h_high - daily_24h_low
+        position_in_range = ((current_price - daily_24h_low) / range_size) * 100 if range_size > 0 else 50
+        
+        return {
+            'current_price': current_price,
+            'daily_24h_high': daily_24h_high,
+            'daily_24h_low': daily_24h_low,
+            'daily_open': daily_open,
+            'today_change_pct': today_change,
+            'prev_close_change_pct': prev_close_change,
+            'distance_to_high': dist_to_high,
+            'distance_to_low': dist_to_low,
+            'range_position': position_in_range  # 0-100, 50=middle
+        }
+    except Exception as e:
+        logger.error(f"Error analyzing 24hr price movement: {e}")
         return None
 
 # ============================================================================
@@ -222,7 +287,7 @@ def analyze_volume_profile(df: pd.DataFrame, speed_data: dict) -> dict:
         
         # Volume spike detection
         max_vol_20 = np.max(volume[-20:]) if len(volume) >= 20 else np.max(volume)
-        vol_spike = current_vol / max_vol_20 if (current_vol := volume[-1]) < max_vol_20 else volume[-1] / max_vol_20
+        vol_spike = (current_vol := volume[-1]) / max_vol_20 if current_vol < max_vol_20 else volume[-1] / max_vol_20
         spike_strength = "EXTREME" if vol_spike > 2.0 else "STRONG" if vol_spike > 1.5 else "NORMAL"
         
         return {
@@ -424,6 +489,68 @@ with col3:
 st.divider()
 
 # ============================================================================
+# SCANNER CAPABILITIES INFO
+# ============================================================================
+
+with st.expander("📋 SCANNER CAPABILITIES & FEATURES", expanded=False):
+    col1, col2, col3 = st.columns(3)
+    
+    with col1:
+        st.write("### 🔥 SPEED DETECTION")
+        st.write("✓ ATR volatility analysis")
+        st.write("✓ Recent momentum (5-candle)")
+        st.write("✓ Hot/Warm/Cool classification")
+        st.write("✓ Spread analysis (Bid-Ask)")
+        st.write("✓ Volume ratio tracking")
+    
+    with col2:
+        st.write("### 📊 VOLUME ANALYSIS")
+        st.write("✓ Volume spike detection")
+        st.write("✓ OBV direction (accumulation)")
+        st.write("✓ A/D line (distribution)")
+        st.write("✓ VWAP calculation")
+        st.write("✓ Volume trend (increasing)")
+    
+    with col3:
+        st.write("### 📈 TECHNICAL INDICATORS")
+        st.write("✓ RSI (overbought/oversold)")
+        st.write("✓ MACD crossovers")
+        st.write("✓ Bollinger Bands")
+        st.write("✓ EMA crossovers (9/21)")
+        st.write("✓ Stochastic RSI")
+    
+    st.divider()
+    
+    col1, col2 = st.columns(2)
+    
+    with col1:
+        st.write("### 💰 PRICE TRACKING (24HR)")
+        st.write("✓ Current price display")
+        st.write("✓ 24hr High/Low levels")
+        st.write("✓ Daily open/close prices")
+        st.write("✓ Today's % change")
+        st.write("✓ Distance to support/resistance")
+    
+    with col2:
+        st.write("### 🎯 TRADING FEATURES")
+        st.write("✓ Pre-market to after-hours (4AM-8PM ET)")
+        st.write("✓ Multi-timeframe scanning (1m/5m/15m)")
+        st.write("✓ Entry/exit level recommendations")
+        st.write("✓ Confidence scoring (0-100)")
+        st.write("✓ Real-time signal generation")
+    
+    st.divider()
+    
+    st.write("### 🚀 PLANNED UPGRADES")
+    st.write("🔹 Ichimoku Cloud analysis")
+    st.write("🔹 Support/Resistance breakouts")
+    st.write("🔹 Wave pattern detection")
+    st.write("🔹 AI-powered signal optimization")
+    st.write("🔹 Historical backtesting engine")
+    st.write("🔹 Trade journal logging")
+    st.write("🔹 Multi-broker integration")
+
+# ============================================================================
 # SIDEBAR CONFIGURATION
 # ============================================================================
 
@@ -450,7 +577,7 @@ with st.sidebar:
     
     st.markdown("### 📈 ANALYSIS ORDER")
     st.write("1️⃣ **SPEED** (ATR, Volatility)")
-    st.write("2️⃣ **SPREAD** (Bid-Ask width)")
+    st.write("2️⃣ **PRICE** (24hr levels, momentum)")
     st.write("3️⃣ **VOLUME** (Spikes, OBV, A/D)")
     st.write("4️⃣ **INDICATORS** (RSI, MACD, BB)")
 
@@ -463,7 +590,7 @@ st.divider()
 col1, col2 = st.columns([3, 1])
 with col1:
     tickers_input = st.text_input(
-        "Enter Tickers (comma-separated) - DAY TRADING STOCKS",
+        "Enter Tickers (comma-separated) - SUB $1 GAINERS",
         value="PLTR,MSTR,NVDA,AMD,SOFI,F,GME,AMC,TSLA",
         placeholder="E.g., PLTR,MSTR,AMD"
     )
@@ -495,17 +622,24 @@ if scan_button:
                 status_text.text(f"🔍 {ticker} ({timeframe}) - {current}/{total_items}")
                 
                 try:
-                    # Fetch data
+                    # Fetch both intraday and daily data
                     df = fetch_intraday_data(ticker, interval=timeframe, period="1d")
+                    daily_df = fetch_daily_data(ticker, period="5d")
+                    
                     if df is None or len(df) < 20:
+                        progress_bar.progress(current / total_items)
                         continue
                     
-                    # Analyze in order: SPEED → SPREAD → VOLUME → INDICATORS
+                    # Get 24hr price data
+                    price_data = analyze_24hr_price_movement(ticker, df, daily_df)
+                    
+                    # Analyze in order: SPEED → PRICE → VOLUME → INDICATORS
                     speed_data = analyze_speed_and_price(df)
                     volume_data = analyze_volume_profile(df, speed_data)
                     indicators = calculate_trading_indicators(df)
                     
                     if not all([speed_data, volume_data, indicators]):
+                        progress_bar.progress(current / total_items)
                         continue
                     
                     # Generate signal
@@ -528,9 +662,10 @@ if scan_button:
                             'BB': indicators['bb_signal'],
                             'Reasons': signal_reasons,
                             'Data': df,
-                            'Speed': speed_data,
-                            'Volume': volume_data,
-                            'Indicators': indicators
+                            'Speed_Data': speed_data,
+                            'Volume_Data': volume_data,
+                            'Indicators': indicators,
+                            'Price_Data': price_data
                         })
                     
                 except Exception as e:
@@ -555,14 +690,12 @@ if scan_button:
                     'Signal': f"{signal_color} {r['Signal']}",
                     'Ticker': r['Ticker'],
                     'TF': r['Timeframe'],
-                    'Score': r['Score'],
                     'Price': r['Price'],
+                    'Score': r['Score'],
                     'Speed': r['Speed'],
                     'ATR%': r['ATR%'],
-                    'Spread': r['Spread'],
                     'Volume': r['Volume'],
                     'RSI': r['RSI'],
-                    'MACD': r['MACD'],
                 })
             
             display_df = pd.DataFrame(display_data)
@@ -592,33 +725,40 @@ if scan_button:
             
             for result in results_sorted[:10]:  # Top 10 setups
                 with st.expander(
-                    f"{result['Signal']} {result['Ticker']} ({result['Timeframe']}) - Score: {result['Score']} - ${result['Price']}",
+                    f"{result['Signal']} {result['Ticker']} ({result['Timeframe']}) - Score: {result['Score']} - {result['Price']}",
                     expanded=False
                 ):
                     # Create columns for analysis
-                    col1, col2, col3 = st.columns(3)
+                    col1, col2, col3, col4 = st.columns(4)
                     
                     with col1:
-                        st.write("**⚡ SPEED**")
-                        st.write(f"Status: {result['Speed']['speed']}")
-                        st.write(f"ATR: {result['Speed']['atr_percent']:.2f}%")
-                        st.write(f"Volatility: {result['Speed']['volatility']:.2f}%")
-                        st.write(f"Momentum: {result['Speed']['momentum']}")
+                        st.write("**💰 PRICE (24HR)**")
+                        if result['Price_Data']:
+                            st.write(f"Current: {result['Price']}")
+                            st.write(f"High: ${result['Price_Data']['daily_24h_high']:.2f}")
+                            st.write(f"Low: ${result['Price_Data']['daily_24h_low']:.2f}")
+                            st.write(f"Today: {result['Price_Data']['today_change_pct']:+.2f}%")
                     
                     with col2:
-                        st.write("**📊 VOLUME & SPREAD**")
-                        st.write(f"Volume Ratio: {result['Speed']['volume_ratio']:.2f}x")
-                        st.write(f"Spread: {result['Speed']['current_spread']:.3f}%")
-                        st.write(f"OBV: {result['Volume']['obv_direction']}")
-                        st.write(f"A/D: {result['Volume']['ad_direction']}")
-                        st.write(f"Spike: {result['Volume']['spike_strength']}")
+                        st.write("**⚡ SPEED**")
+                        st.write(f"Status: {result['Speed_Data']['speed']}")
+                        st.write(f"ATR: {result['Speed_Data']['atr_percent']:.2f}%")
+                        st.write(f"Volatility: {result['Speed_Data']['volatility']:.2f}%")
+                        st.write(f"Momentum: {result['Speed_Data']['momentum']}")
                     
                     with col3:
+                        st.write("**📊 VOLUME**")
+                        st.write(f"Ratio: {result['Speed_Data']['volume_ratio']:.2f}x")
+                        st.write(f"Spike: {result['Volume_Data']['spike_strength']}")
+                        st.write(f"OBV: {result['Volume_Data']['obv_direction']}")
+                        st.write(f"A/D: {result['Volume_Data']['ad_direction']}")
+                    
+                    with col4:
                         st.write("**📈 INDICATORS**")
-                        st.write(f"RSI: {result['Indicators']['rsi']:.0f} ({result['Indicators']['rsi_signal']})")
+                        st.write(f"RSI: {result['Indicators']['rsi']:.0f}")
                         st.write(f"MACD: {result['Indicators']['macd_crossover']}")
                         st.write(f"EMA: {result['Indicators']['ma_cross']}")
-                        st.write(f"Stoch: {result['Indicators']['stoch_k']:.0f} ({result['Indicators']['stoch_signal']})")
+                        st.write(f"BB: {result['Indicators']['bb_signal']}")
                     
                     st.divider()
                     
@@ -628,19 +768,24 @@ if scan_button:
                         st.write(f"✓ {reason}")
                     
                     # Entry/Exit levels
-                    speed = result['Speed']
+                    speed = result['Speed_Data']
                     indicators = result['Indicators']
+                    price_data = result['Price_Data']
                     
-                    col1, col2, col3 = st.columns(3)
+                    col1, col2, col3, col4 = st.columns(4)
                     with col1:
                         st.write("**ENTRY:**")
-                        st.write(f"Price: ${speed['current_price']:.2f}")
+                        st.write(f"${speed['current_price']:.2f}")
                     with col2:
                         st.write("**SUPPORT:**")
                         st.write(f"${indicators['bb_low']:.2f}")
                     with col3:
                         st.write("**RESISTANCE:**")
                         st.write(f"${indicators['bb_high']:.2f}")
+                    with col4:
+                        st.write("**24H LOW:**")
+                        if price_data:
+                            st.write(f"${price_data['daily_24h_low']:.2f}")
         
         else:
             st.warning("⏳ No strong signals found. Adjust thresholds or wait for better setup.")
@@ -652,6 +797,6 @@ col1, col2, col3 = st.columns(3)
 with col1:
     st.caption(f"⏰ {now.strftime('%I:%M:%S %p ET')} | Market: {market_status}")
 with col2:
-    st.caption("🔄 Refresh: 60s | Real-time Yahoo Finance")
+    st.caption("🔄 Refresh: 60s | Real-time Yahoo Finance | Pre-Market to After-Hours")
 with col3:
     st.caption("⚠️ Not financial advice - Day trading risk")
