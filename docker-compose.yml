@@ -1,0 +1,12 @@
+version: '3.8'
+
+services:
+  momentum-engine:
+    build: .
+    ports:
+      - "8501:8501"
+    environment:
+      - PYTHONUNBUFFERED=1
+    volumes:
+      - .:/app
+    restart: unless-stopped
